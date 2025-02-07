@@ -9,9 +9,7 @@ import optuna
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, confusion_matrix, classification_report
 
-###############################################################################
-# 1) Load & Prepare the Chess dataset
-###############################################################################
+from imblearn.over_sampling import SMOTE
 
 df = pd.read_csv("/kaggle/input/chess/games.csv")
 
@@ -37,10 +35,6 @@ y = y.astype('int64')
 X = X.values
 y = y.values
 
-###############################################################################
-# 2) Train/Validation/Test Split
-###############################################################################
-
 X_trainval, X_test, y_trainval, y_test = train_test_split(
     X, 
     y, 
@@ -61,15 +55,15 @@ print("Train size:", X_train.shape[0])
 print("Val size:  ", X_val.shape[0])
 print("Test size: ", X_test.shape[0])
 
-###############################################################################
-# 3) Convert to PyTorch Tensors & DataLoaders
-###############################################################################
+sm = SMOTE(random_state=7)
+X_train_sm, y_train_sm = sm.fit_resample(X_train, y_train)
+print("After SMOTE, train size:", X_train_sm.shape[0])
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Using device:", device)
 
-X_train_t = torch.tensor(X_train, dtype=torch.float32)
-y_train_t = torch.tensor(y_train, dtype=torch.long)
+X_train_t = torch.tensor(X_train_sm, dtype=torch.float32)
+y_train_t = torch.tensor(y_train_sm, dtype=torch.long)
 
 X_val_t   = torch.tensor(X_val,   dtype=torch.float32)
 y_val_t   = torch.tensor(y_val,   dtype=torch.long)
@@ -80,32 +74,34 @@ val_dataset   = TensorDataset(X_val_t,   y_val_t)
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 val_loader   = DataLoader(val_dataset,   batch_size=64, shuffle=False)
 
-###############################################################################
-# 4) Define a Simple PyTorch Model (One Hidden Layer)
-###############################################################################
-
 class ChessNet(nn.Module):
-    def __init__(self, input_dim, hidden_dim=64, num_classes=3, activation='relu'):
+    def __init__(self, input_dim, hidden_dim1=128, hidden_dim2=64, dropout=0.2, activation='relu'):
         super().__init__()
         self.activation_name = activation
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, num_classes)
+        self.fc1 = nn.Linear(input_dim, hidden_dim1)
+        self.fc2 = nn.Linear(hidden_dim1, hidden_dim2)
+        self.fc3 = nn.Linear(hidden_dim2, 3)
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
         if self.activation_name == 'relu':
             x = torch.relu(self.fc1(x))
         else:
             x = torch.tanh(self.fc1(x))
-        x = self.fc2(x)  # raw logits for multi-class
-        return x
+        x = self.drop(x)
 
-###############################################################################
-# 5) Train/Validate Functions
-###############################################################################
+        if self.activation_name == 'relu':
+            x = torch.relu(self.fc2(x))
+        else:
+            x = torch.tanh(self.fc2(x))
+        x = self.drop(x)
+
+        x = self.fc3(x)
+        return x
 
 def train_one_epoch(model, loader, criterion, optimizer):
     model.train()
-    running_loss = 0.0
+    total_loss = 0.0
     for Xb, yb in loader:
         Xb, yb = Xb.to(device), yb.to(device)
         
@@ -115,8 +111,8 @@ def train_one_epoch(model, loader, criterion, optimizer):
         loss.backward()
         optimizer.step()
         
-        running_loss += loss.item() * Xb.size(0)
-    return running_loss / len(loader.dataset)
+        total_loss += loss.item() * Xb.size(0)
+    return total_loss / len(loader.dataset)
 
 def validate(model, loader):
     model.eval()
@@ -131,69 +127,78 @@ def validate(model, loader):
             all_targets.append(yb.numpy())
     all_preds = np.concatenate(all_preds)
     all_targets = np.concatenate(all_targets)
-    return f1_score(all_targets, all_preds, average='macro')  # macro-F1
-
-###############################################################################
-# 6) Optuna Hyperparameter Tuning (Objective)
-###############################################################################
-
-import optuna
+    return f1_score(all_targets, all_preds, average='macro') 
 
 def objective(trial):
-    
-    hidden_dim = trial.suggest_categorical("hidden_dim", [64,128,256])
-    activation = trial.suggest_categorical("activation", ["relu","tanh"])
-    lr = trial.suggest_float("lr", 1e-4,1e-2, log=True)
-    weight_decay = trial.suggest_float("weight_decay", 1e-5,1e-3, log=True)
-    n_epochs = trial.suggest_int("n_epochs",5,20)
 
-    model = ChessNet(input_dim=X_train.shape[1], hidden_dim=hidden_dim, activation=activation).to(device)
+    hidden_dim1 = trial.suggest_categorical("hidden_dim1", [64,128,256])
+    hidden_dim2 = trial.suggest_categorical("hidden_dim2", [32,64,128])
+    dropout     = trial.suggest_float("dropout", 0.0, 0.5, step=0.1)
+    activation  = trial.suggest_categorical("activation", ["relu", "tanh"])
+    lr          = trial.suggest_float("lr", 1e-4,1e-2, log=True)
+    weight_decay= trial.suggest_float("weight_decay", 1e-5,1e-3, log=True)
+    n_epochs    = trial.suggest_int("n_epochs",10,50)
+
+    model = ChessNet(
+        input_dim=X_train.shape[1],
+        hidden_dim1=hidden_dim1,
+        hidden_dim2=hidden_dim2,
+        dropout=dropout,
+        activation=activation
+    ).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     best_val_f1 = 0.0
+    patience = 0
+    patience_limit = 5 
+
     for epoch in range(n_epochs):
         train_one_epoch(model, train_loader, criterion, optimizer)
+        
         val_f1 = validate(model, val_loader)
+
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
-        # Optional: could do early stopping if val_f1 not improving
-    
+            patience = 0
+        else:
+            patience += 1
+
+        if patience >= patience_limit:
+            break
+
     return best_val_f1
-    
-###############################################################################
-# 7) Run Optuna Study
-###############################################################################
 
 study = optuna.create_study(direction="maximize")
-study.optimize(objective, n_trials=20)  
+study.optimize(objective, n_trials=100) 
 print("Best trial value (Val F1):", study.best_trial.value)
 print("Best hyperparams:", study.best_trial.params)
 
-###############################################################################
-# 8) Retrain Final Model on (Train+Val), Evaluate on Test
-###############################################################################
-
-X_trainval = np.concatenate((X_train, X_val), axis=0)
-y_trainval = np.concatenate((y_train, y_val), axis=0)
-
-trainval_dataset = TensorDataset(
-    torch.tensor(X_trainval, dtype=torch.float32),
-    torch.tensor(y_trainval, dtype=torch.long)
+X_trainval_sm, y_trainval_sm = sm.fit_resample(
+    np.concatenate((X_train, X_val), axis=0),
+    np.concatenate((y_train, y_val), axis=0)
 )
 
+trainval_dataset = TensorDataset(
+    torch.tensor(X_trainval_sm, dtype=torch.float32),
+    torch.tensor(y_trainval_sm, dtype=torch.long)
+)
 trainval_loader = DataLoader(trainval_dataset, batch_size=64, shuffle=True)
 
-best_params = study.best_trial.params
-hidden_dim  = best_params["hidden_dim"]
-activation  = best_params["activation"]
-lr          = best_params["lr"]
-weight_decay= best_params["weight_decay"]
-n_epochs    = best_params["n_epochs"]
+best_params   = study.best_trial.params
+hidden_dim1   = best_params["hidden_dim1"]
+hidden_dim2   = best_params["hidden_dim2"]
+dropout       = best_params["dropout"]
+activation    = best_params["activation"]
+lr            = best_params["lr"]
+weight_decay  = best_params["weight_decay"]
+n_epochs      = best_params["n_epochs"]
 
 final_model = ChessNet(
     input_dim=X_train.shape[1],
-    hidden_dim=hidden_dim,
+    hidden_dim1=hidden_dim1,
+    hidden_dim2=hidden_dim2,
+    dropout=dropout,
     activation=activation
 ).to(device)
 
@@ -214,8 +219,6 @@ with torch.no_grad():
 
 test_f1 = f1_score(y_true_test, preds_test, average='macro')
 print("Final Test macro-F1:", test_f1)
-
-from sklearn.metrics import confusion_matrix, classification_report
 
 cm = confusion_matrix(y_true_test, preds_test, labels=[0,1,2])
 print("Confusion Matrix:\n", cm)
